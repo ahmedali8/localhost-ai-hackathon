@@ -26,6 +26,7 @@ import json
 import os
 import pathlib
 import sys
+import threading
 import time
 import wave
 
@@ -40,6 +41,31 @@ SR = 16000  # audio sample rate (must match the firmware)
 WAV_PATH = pathlib.Path(__file__).resolve().parent.parent / "data" / "last_recording.wav"
 
 _audio = bytearray()  # accumulates PCM16 bytes for the current recording
+
+
+_index_lock = threading.Lock()  # serialize ingests: one Exo cognify at a time
+
+
+def index_async(text: str, source: str) -> None:
+    """Ingest a capture into the cognee-mcp knowledge graph in the background.
+
+    remember() runs an Exo cognify (seconds), so it runs in a daemon thread — the
+    serial loop must never stall — and behind a lock so two captures don't kick off
+    concurrent cognifies that contend for the model. Best-effort: the Markdown store
+    is the source of truth and `cognee_ingest.py --reset` can rebuild the graph later.
+    """
+
+    def run() -> None:
+        with _index_lock:
+            try:
+                import cognee_ingest
+
+                cognee_ingest.remember(text)
+                print(f"[cognee] indexed ({source})")
+            except Exception as exc:  # noqa: BLE001 — best-effort; never crash the bridge
+                print(f"[cognee] index skipped: {exc}")
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def find_port() -> str:
@@ -83,6 +109,7 @@ def handle_rec_end(ser: "serial.Serial") -> None:
         if text:
             total = append_note(text, "voice")
             print(f"[saved/voice] {text!r}  (total {total})")
+            index_async(text, "voice")
             send(ser, {"status": "SAVED"})
             send(ser, {"echo": text})
             send(ser, {"count": total})
@@ -102,6 +129,7 @@ def handle(ser: "serial.Serial", msg: dict) -> None:
         text, src = msg.get("text", ""), msg.get("src", "keyboard")
         total = append_note(text, src)
         print(f"[saved/{src}] {text!r}  (total {total})")
+        index_async(text, src)
         send(ser, {"status": "SAVED"})
         send(ser, {"echo": text})
         send(ser, {"count": total})
@@ -117,6 +145,10 @@ def handle(ser: "serial.Serial", msg: dict) -> None:
                 print(f"[audio decode err] {exc}")
     elif kind == "rec_end":
         handle_rec_end(ser)
+    elif kind == "rec_cancel":
+        _audio.clear()
+        print("[audio] canceled — buffer dropped")
+        send(ser, {"status": "canceled"})
     else:
         print(f"[ignored] {msg}")
 

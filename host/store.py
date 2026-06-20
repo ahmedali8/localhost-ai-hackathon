@@ -40,3 +40,27 @@ def count_notes() -> int:
         for line in CAPTURES.read_text(encoding="utf-8").splitlines()
         if line.startswith("- **")
     )
+
+
+def read_notes() -> list[tuple[str, str, str]]:
+    """Return every capture as ``(timestamp, source, text)``, oldest first.
+
+    Parses the same line format ``append_note`` writes:
+    ``- **<ts>** _(<src>)_ — <text>``. Malformed lines are skipped. This keeps
+    the store's format owned in one place (reindex.py consumes this, not the raw
+    Markdown).
+    """
+    if not CAPTURES.exists():
+        return []
+    notes: list[tuple[str, str, str]] = []
+    for line in CAPTURES.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("- **") or " — " not in line:
+            continue
+        prefix, text = line.split(" — ", 1)
+        try:
+            ts = prefix.split("**", 2)[1]
+            src = prefix.split("_(", 1)[1].split(")_", 1)[0]
+        except IndexError:
+            continue
+        notes.append((ts, src, text.strip()))
+    return notes

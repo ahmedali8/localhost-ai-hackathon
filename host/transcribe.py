@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 
-MODEL = os.environ.get("WHISPER_MODEL", "mlx-community/whisper-small")
+MODEL = os.environ.get("WHISPER_MODEL", "mlx-community/whisper-small-mlx")
 
 
 def transcribe_wav(path: str) -> str:
