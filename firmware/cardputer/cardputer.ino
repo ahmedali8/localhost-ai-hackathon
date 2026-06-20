@@ -10,7 +10,10 @@
  *  status lines that this firmware renders on the 240x135 screen.
  *
  *      TYPE on the keyboard, press Enter ............ sends a (keyboard) note
- *      Press Enter on an EMPTY line, or tap G0 ...... toggles voice recording
+ *      Press Enter on an EMPTY line, tap G0, opt+R .. toggles voice recording
+ *      Backtick (`, top-left/ESC key) .............. clears the line / cancels a recording (any modifier)
+ *      fn + ; / .  (up/down) ....................... scrolls the last-capture pane
+ *      ctrl + L .................................... clears the input line
  *
  *  No intelligence runs here — the device only captures input and renders
  *  status. All storage / speech-to-text happens on the Mac.
@@ -38,7 +41,8 @@
  *      {"type":"note","src":"keyboard","text":"<typed text>"}
  *      {"type":"rec_start"}                                   // recording began
  *      {"type":"audio","seq":<n>,"b64":"<pcm16le base64>","last":false}
- *      {"type":"rec_end"}                                     // recording ended
+ *      {"type":"rec_end"}                                     // recording ended (finalize)
+ *      {"type":"rec_cancel"}                                  // recording aborted (discard)
  *    host -> device:
  *      {"status":"<=18 chars>"}   // shown right-aligned in the status bar
  *      {"echo":"<text>"}          // shown in the LAST pane
@@ -68,16 +72,20 @@
  * [1] CONFIGURATION  — all tunables live here; no magic numbers below.
  *---------------------------------------------------------------------------*/
 
-// Display geometry (landscape 240x135). The screen is split top-to-bottom into
-// a status bar, a body pane (last capture), and an input line.
-static constexpr int DISP_W = 240;
-static constexpr int DISP_H = 135;
-static constexpr int BAR_H  = 14;                       // status bar height
-static constexpr int IN_H   = 16;                       // input line height
-static constexpr int BODY_Y = BAR_H;                    // body pane top
-static constexpr int BODY_H = DISP_H - BAR_H - IN_H;    // body pane height
-static constexpr int IN_Y   = DISP_H - IN_H;            // input line top
-static constexpr int COLS   = 40;                       // chars per line @ textsize 1 (~6 px glyphs)
+// Display geometry (landscape 240x135). Four zones, top to bottom:
+//   status bar | body pane (last capture / live VU) | input line | hint bar
+static constexpr int DISP_W  = 240;
+static constexpr int DISP_H  = 135;
+static constexpr int BAR_H   = 14;                                  // status bar height
+static constexpr int IN_H    = 14;                                  // input line height
+static constexpr int HINT_H  = 12;                                  // key-legend footer height
+static constexpr int BODY_Y  = BAR_H;                              // body pane top
+static constexpr int BODY_H  = DISP_H - BAR_H - IN_H - HINT_H;     // body pane height (95)
+static constexpr int IN_Y    = BODY_Y + BODY_H;                    // input line top  (109)
+static constexpr int HINT_Y  = IN_Y + IN_H;                        // hint bar top    (123)
+static constexpr int LINE_H  = 8;                                  // glyph cell height @ textsize 1
+static constexpr int COLS    = 40;                                 // chars per line @ textsize 1 (~6 px glyphs)
+static constexpr int BODY_ROWS = BODY_H / LINE_H - 1;             // visible text rows (minus the header row)
 
 // Audio. 16 kHz mono int16 is what Whisper wants. CHUNK is the per-read size:
 // 1600 samples = 0.1 s = 3200 bytes raw -> ~4267 base64 chars per frame.
@@ -107,7 +115,12 @@ static int  inLen = 0;
 
 // UI text shown in the body pane (host echoes captures here). Doubles as the
 // on-screen help on boot.
-static char last[LAST_MAX] = "type+Enter=note  |  empty Enter / G0 = record";
+static char last[LAST_MAX] = "type + Enter = note. empty Enter or G0 = record.";
+
+// Body scroll position (wrapped-line offset) for reading long captures, and the
+// current chunk's peak amplitude (0..32767) that drives the recording VU meter.
+static int scrollOff = 0;
+static int micPeak   = 0;
 
 // Right-aligned status word in the bar (host-driven: SAVED, TRANSCRIBING, ...).
 static char status[20] = "idle";
@@ -131,32 +144,91 @@ static uint32_t recStartMs = 0;       // for the elapsed-seconds readout
  * [3] DISPLAY  — three independently repainted regions (cheap partial redraws).
  *---------------------------------------------------------------------------*/
 
-/// Paint the top status bar: "notes:N" left, status word right.
+/// Count how many display rows `s` occupies once hard-wrapped at COLS.
+static int wrapRows(const char* s) {
+  int col = 0, rows = 1;
+  for (; *s; ++s) { if (col >= COLS) { ++rows; col = 0; } ++col; }
+  return rows;
+}
+
+/// Keep scrollOff within [0, max] for the current `last` text.
+static void clampScroll() {
+  const int maxOff = wrapRows(last) - BODY_ROWS;
+  if (scrollOff > maxOff) scrollOff = maxOff;
+  if (scrollOff < 0)      scrollOff = 0;
+}
+
+/// Paint the top status bar: status word left, "notes:N" right.
 /// Background turns red while recording so the state is obvious at a glance.
 static void drawBar() {
   const uint16_t bg = recording ? TFT_RED : TFT_DARKGREEN;
   M5Cardputer.Display.fillRect(0, 0, DISP_W, BAR_H, bg);
   M5Cardputer.Display.setTextSize(1);
   M5Cardputer.Display.setTextColor(TFT_WHITE, bg);
-  char left[32];
-  snprintf(left, sizeof(left), "notes:%d", noteCount);
-  M5Cardputer.Display.drawString(left, 3, 3);
-  const int x = DISP_W - static_cast<int>(strlen(status)) * 6 - 4;  // right-align
-  M5Cardputer.Display.drawString(status, x, 3);
+  M5Cardputer.Display.drawString(status, 3, 3);
+  char right[20];
+  snprintf(right, sizeof(right), "notes:%d", noteCount);
+  const int x = DISP_W - static_cast<int>(strlen(right)) * 6 - 4;  // right-align
+  M5Cardputer.Display.drawString(right, x, 3);
 }
 
-/// Paint the body pane: the last capture, hard-wrapped at COLS into the sprite.
+/// Paint the always-on key-legend footer. Hints change with the mode so the
+/// available controls are discoverable without memorizing them.
+static void drawHint() {
+  M5Cardputer.Display.fillRect(0, HINT_Y, DISP_W, HINT_H, TFT_BLACK);
+  M5Cardputer.Display.setTextSize(1);
+  M5Cardputer.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  const char* h = recording ? "ent/G0 stop   ` cancel"
+                            : "ent send  ` clr  G0 rec  fn ;/. scroll";
+  M5Cardputer.Display.drawString(h, 3, HINT_Y + 2);
+}
+
+/// Body while recording: elapsed time + a live VU meter driven by micPeak.
+static void drawBodyRecording() {
+  const uint32_t secs = (millis() - recStartMs) / 1000;
+  body.setTextColor(TFT_RED, TFT_BLACK);
+  body.setCursor(2, 2);
+  char hdr[24];
+  snprintf(hdr, sizeof(hdr), "* REC  %lu:%02lu",
+           static_cast<unsigned long>(secs / 60), static_cast<unsigned long>(secs % 60));
+  body.print(hdr);
+
+  // VU bar. sqrt of the normalized peak gives a more natural, lively swing than
+  // a raw linear map; colour shifts green -> yellow -> red toward clipping.
+  const int bx = 4, by = 36, bw = DISP_W - 8, bh = 20;
+  body.drawRect(bx, by, bw, bh, TFT_DARKGREY);
+  float frac = sqrtf(static_cast<float>(micPeak) / 32767.0f);
+  if (frac > 1.0f) frac = 1.0f;
+  const int fillw = static_cast<int>(frac * (bw - 2));
+  const uint16_t c = (micPeak > 30000) ? TFT_RED
+                   : (micPeak > 16000) ? TFT_YELLOW : TFT_GREEN;
+  if (fillw > 0) body.fillRect(bx + 1, by + 1, fillw, bh - 2, c);
+
+  body.setTextColor(TFT_WHITE, TFT_BLACK);
+  body.setCursor(2, by + bh + 8);
+  body.print("speak now");
+}
+
+/// Paint the body pane. While recording it shows the VU meter; otherwise the
+/// last capture, hard-wrapped at COLS and scrolled by scrollOff.
 static void drawBody() {
   body.fillSprite(TFT_BLACK);
   body.setTextSize(1);
+  if (recording) { drawBodyRecording(); body.pushSprite(0, BODY_Y); return; }
+
   body.setTextColor(TFT_CYAN, TFT_BLACK);
   body.setCursor(0, 0);
-  body.print("LAST:\n");
+  body.print(scrollOff > 0 ? "LAST  ^" : "LAST");
+
   body.setTextColor(TFT_WHITE, TFT_BLACK);
-  int col = 0;
+  int col = 0, row = 0;                                // row = wrapped-line index over full text
   for (const char* p = last; *p; ++p) {
-    if (col >= COLS) { body.print('\n'); col = 0; }   // manual wrap (sprite clips otherwise)
-    body.print(*p);
+    if (col >= COLS) { ++row; col = 0; }
+    const int vis = row - scrollOff;                   // 0-based row within the visible window
+    if (vis >= 0 && vis < BODY_ROWS) {
+      if (col == 0) body.setCursor(0, (vis + 1) * LINE_H);  // +1 leaves the header row
+      body.print(*p);
+    }
     ++col;
   }
   body.pushSprite(0, BODY_Y);
@@ -171,10 +243,10 @@ static void drawInput() {
   if (inLen > 37) tail += (inLen - 37);               // keep the cursor visible
   char line[44];
   snprintf(line, sizeof(line), "> %s_", tail);
-  M5Cardputer.Display.drawString(line, 3, IN_Y + 4);
+  M5Cardputer.Display.drawString(line, 3, IN_Y + 3);
 }
 
-static void redrawAll() { drawBar(); drawBody(); drawInput(); }
+static void redrawAll() { drawBar(); drawBody(); drawInput(); drawHint(); }
 
 /// Update the status word and repaint just the bar.
 static void setStatus(const char* s) {
@@ -236,6 +308,7 @@ static void handleLine(const char* line) {
   if (doc["echo"].is<const char*>()) {
     strncpy(last, doc["echo"].as<const char*>(), sizeof(last) - 1);
     last[sizeof(last) - 1] = '\0';
+    scrollOff = 0;                                      // show the new capture from the top
     drawBody();
   }
   if (doc["count"].is<int>()) {
@@ -267,21 +340,50 @@ static void handleSerial() {
  *  the duration of a recording.
  *---------------------------------------------------------------------------*/
 
-/// Begin a recording: free I2S from the speaker, start the mic, kick the first chunk.
+/// Re-assert the ADV mic's ES8311 ADC configuration.
+///
+/// The ADV mic is an ES8311 codec (i2c 0x18 on the internal In_I2C bus) shared
+/// with the speaker. M5Unified's speaker leaves the codec in a DAC-only clock
+/// mode (reg 0x01 = 0xB5) with the ADC analog blocks powered down, so the mic
+/// reads pure silence. There is no external MCLK to fix — reg 0x01 = 0xBA
+/// derives the ADC clock from BCLK. Writing this ADC register block directly,
+/// after Mic.begin(), restores capture. Verified on hardware: peak 0 -> 9096.
+/// (Mirrors M5Unified::_microphone_enabled_cb_cardputer_adv. ADC gain 0x17 set
+/// to 0xBF (0 dB) — 0xFF max gain clipped close-mic speech at ~full scale.)
+static void es8311MicEnable() {
+  static const uint8_t regs[][2] = {
+    {0x00, 0x80},  // RESET / CSM power on
+    {0x01, 0xBA},  // CLOCK_MANAGER: derive MCLK from BCLK
+    {0x02, 0x18},  // CLOCK_MANAGER: MULT_PRE=3
+    {0x0D, 0x01},  // SYSTEM: power up analog circuitry
+    {0x0E, 0x02},  // SYSTEM: enable analog PGA + ADC modulator
+    {0x14, 0x10},  // ADC: select Mic1p-Mic1n, PGA gain min
+    {0x17, 0xBF},  // ADC: volume (0 dB — avoids clipping close-mic speech)
+    {0x1C, 0x6A},  // ADC: EQ bypass + cancel DC offset
+  };
+  for (const auto& r : regs) M5.In_I2C.writeRegister8(0x18, r[0], r[1], 100000);
+}
+
+/// Begin a recording: start the mic, revive the ADC, kick the first chunk.
 static void startRec() {
   if (recording) return;
-  M5Cardputer.Speaker.end();                           // release shared I2S
   if (!M5Cardputer.Mic.begin()) { setStatus("MIC ERR"); return; }
+  delay(120);                                          // ES8311 ADC power-up
+  es8311MicEnable();                                   // revive ADC clobbered by the shared speaker
+  delay(20);                                           // let the register writes settle
   recording  = true;
   audioSeq   = 0;
+  micPeak    = 0;
   recStartMs = millis();
   sendType("rec_start");
   fillBuf = chunkA;
   M5Cardputer.Mic.record(fillBuf, CHUNK, SR);          // async fill begins
-  setStatus("REC 0");
+  setStatus("REC");
+  drawBody();                                          // switch body into VU mode
+  drawHint();                                          // recording-mode hints
 }
 
-/// End a recording: flush the in-flight chunk, stop the mic, tell the host.
+/// End a recording: flush the in-flight chunk, stop the mic, finalize on host.
 static void stopRec() {
   if (!recording) return;
   recording = false;
@@ -290,10 +392,27 @@ static void stopRec() {
   M5Cardputer.Mic.end();
   sendType("rec_end");
   setStatus("sending");
+  drawBody();                                          // back to LAST view
+  drawHint();
+}
+
+/// Abort a recording: stop the mic and tell the host to discard the buffered
+/// audio (chunks already streamed), without finalizing/transcribing.
+static void cancelRec() {
+  if (!recording) return;
+  recording = false;
+  while (M5Cardputer.Mic.isRecording()) delay(1);
+  M5Cardputer.Mic.end();
+  sendType("rec_cancel");
+  setStatus("canceled");
+  scrollOff = 0;
+  drawBody();
+  drawHint();
 }
 
 /// Per-loop pump: when the current chunk finishes, immediately start the next
-/// (into the other buffer) so capture is gapless, then send the finished one.
+/// (into the other buffer) so capture is gapless, then send the finished one
+/// and refresh the VU meter from its peak amplitude.
 static void pumpRecording() {
   if (!recording) return;
   if (M5Cardputer.Mic.isRecording()) return;           // still filling — nothing to do
@@ -303,10 +422,15 @@ static void pumpRecording() {
   M5Cardputer.Mic.record(fillBuf, CHUNK, SR);           // keep capturing
   sendAudioChunk(finished, CHUNK);                      // ship the finished chunk
 
-  const uint32_t secs = (millis() - recStartMs) / 1000; // live elapsed readout
+  int pk = 0;                                           // peak of this chunk -> VU meter
+  for (size_t i = 0; i < CHUNK; ++i) { const int v = abs(finished[i]); if (v > pk) pk = v; }
+  micPeak = pk;
+
+  const uint32_t secs = (millis() - recStartMs) / 1000; // keep the bar's elapsed readout
   char s[20];
   snprintf(s, sizeof(s), "REC %lu", static_cast<unsigned long>(secs));
   if (strcmp(s, status) != 0) setStatus(s);
+  drawBody();                                           // animate the VU meter
 }
 
 /*-----------------------------------------------------------------------------
@@ -318,8 +442,42 @@ static void handleKeys() {
   if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
 
   const auto ks = M5Cardputer.Keyboard.keysState();
-  bool dirty = false;
 
+  // ESC / clear — the backtick (`) key. Handled BEFORE the fn/ctrl/opt branches
+  // so a held modifier (e.g. fn) can't swallow it: clears the input line, or cancels
+  // an in-progress recording. Fires regardless of modifiers.
+  for (const char c : ks.word) {
+    if (c == '`') {
+      if (recording)  cancelRec();
+      else if (inLen) { inLen = 0; input[0] = '\0'; drawInput(); }
+      return;                                           // never types the backtick
+    }
+  }
+
+  // fn + ; / .  -> scroll the body pane (the ;/. keys carry the up/down arrows).
+  if (ks.fn) {
+    for (const char c : ks.word) {
+      if (c == ';') { scrollOff--; clampScroll(); drawBody(); }
+      else if (c == '.') { scrollOff++; clampScroll(); drawBody(); }
+    }
+    return;                                             // fn combos never type
+  }
+  // ctrl + l -> clear the input line.
+  if (ks.ctrl) {
+    for (const char c : ks.word) {
+      if (c == 'l' || c == 'L') { inLen = 0; input[0] = '\0'; drawInput(); }
+    }
+    return;
+  }
+  // opt + r -> record toggle (keyboard alternative to the G0 side button).
+  if (ks.opt) {
+    for (const char c : ks.word) {
+      if (c == 'r' || c == 'R') { recording ? stopRec() : startRec(); }
+    }
+    return;
+  }
+
+  bool dirty = false;
   for (const char c : ks.word) {                       // printable characters
     if (inLen < static_cast<int>(IN_MAX) - 1) {
       input[inLen++] = c;
@@ -369,6 +527,7 @@ void setup() {
     M5Cardputer.Display.drawString("SPRITE FAIL", 4, 40);
   }
   input[0] = '\0';
+
   redrawAll();
 }
 
