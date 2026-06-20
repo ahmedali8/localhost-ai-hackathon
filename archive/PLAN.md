@@ -42,7 +42,7 @@ ollama list                         # verify both show up
 
 ### 1c. Python env (3.12) + deps  — running in background
 ```bash
-cd ~/scorpio/localhost-agentic-hackathon
+cd <repo>
 /opt/homebrew/bin/python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
@@ -79,7 +79,7 @@ arduino-cli upload  -b esp32:esp32:m5stack_cardputer -p "$PORT" janus.ino
 
 ## 2. RUN  (env + launch)
 ```bash
-cd ~/scorpio/localhost-agentic-hackathon && source .venv/bin/activate
+cd <repo> && source .venv/bin/activate
 export OLLAMA_HOST=http://localhost:11434
 export LLM_MODEL=llama3.1:8b            # brain: extraction + contradiction judge
 export JANUS_OLLAMA_CHAT_MODEL=llama3.1:8b
