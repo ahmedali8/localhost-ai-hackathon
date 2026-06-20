@@ -14,11 +14,3 @@ data/
 # Secrets / environment
 .env
 .env.*
-
-# Archived prototypes — kept locally for reuse, not pushed
-archive/
-
-# Claude Code scratch (plans are tracked under .claude/plans/)
-.agents/
-.claude/skills/
-skills-lock.json
