@@ -1,0 +1,4 @@
+# Exclude old prototypes + vendored libs from GitHub language stats (linguist)
+archive/** linguist-vendored
+*.min.js linguist-vendored
+uv.lock linguist-generated
